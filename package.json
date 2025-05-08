@@ -1,0 +1,31 @@
+{
+  "name": "filament-docs-mcp",
+  "version": "1.0.0",
+  "type": "module",
+  "bin": {
+    "filament-docs-mcp": "./build/index.js"
+  },
+  "scripts": {
+    "build": "tsc && chmod 755 build/index.js",
+    "start": "node build/index.js",
+    "dev": "tsc --watch"
+  },
+  "keywords": [
+    "mcp",
+    "filament",
+    "documentation"
+  ],
+  "author": "",
+  "license": "MIT",
+  "description": "MCP server for Filament documentation",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.11.0",
+    "axios": "^1.9.0",
+    "cheerio": "^1.0.0",
+    "zod": "^3.24.4"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.16",
+    "typescript": "^5.8.3"
+  }
+}

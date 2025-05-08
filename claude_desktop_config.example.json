@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "filament-docs-mcp": {
+      "command": "node",
+      "args": [
+        "/ABSOLUTE/PATH/TO/filament-docs-mcp/build/index.js"
+      ]
+    }
+  }
+}
