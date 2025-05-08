@@ -15,6 +15,7 @@ const DEFAULT_BRANCH = '3.x';
 // Define types for our documentation data
 interface DocPage {
   title: string;
+  subtitle?: string;
   url: string;
   content: string;
   version: string;
@@ -163,26 +164,56 @@ async function listGitHubDirectory(path: string, branch = DEFAULT_BRANCH, retrie
   return []; // Return empty array as fallback
 }
 
-// Extract title from markdown content
-function extractTitleFromMarkdown(content: string): string {
-  // Look for YAML frontmatter title
+// Extract title and subtitle from markdown content
+function extractTitleFromMarkdown(content: string): { title: string; subtitle?: string } {
+  let title = '';
+  let subtitle: string | undefined;
+
+  // Look for YAML frontmatter title and subtitle
   const frontmatterMatch = content.match(/^---\s+([\s\S]*?)---/);
   if (frontmatterMatch && frontmatterMatch[1]) {
-    const titleMatch = frontmatterMatch[1].match(/title:\s*(.+)$/m);
+    const frontmatter = frontmatterMatch[1];
+
+    // Extract title from frontmatter
+    const titleMatch = frontmatter.match(/title:\s*(.*?)(\n|$)/);
     if (titleMatch && titleMatch[1]) {
-      return titleMatch[1].trim();
+      title = titleMatch[1].trim();
+    }
+
+    // Extract subtitle if present in frontmatter
+    const subtitleMatch = frontmatter.match(/subtitle:\s*(.*?)(\n|$)/);
+    if (subtitleMatch && subtitleMatch[1]) {
+      subtitle = subtitleMatch[1].trim();
     }
   }
 
-  // Look for the first heading (# Title)
-  const titleMatch = content.match(/^#\s+(.+)$/m);
-  if (titleMatch && titleMatch[1]) {
-    return titleMatch[1].trim();
+  // If no title found in frontmatter, look for the first heading (# Title)
+  if (!title) {
+    const titleMatch = content.match(/^#\s+(.+)$/m);
+    if (titleMatch && titleMatch[1]) {
+      title = titleMatch[1].trim();
+    } else {
+      // If no heading found, use the first line or a default title
+      const firstLine = content.split('\n')[0].trim();
+      title = firstLine || 'Untitled Document';
+    }
   }
 
-  // If no heading found, use the first line or a default title
-  const firstLine = content.split('\n')[0].trim();
-  return firstLine || 'Untitled Document';
+  // If no subtitle found in frontmatter, try to extract from content
+  // Look for version-specific information in the first few lines
+  if (!subtitle) {
+    const contentLines = content.split('\n').slice(0, 20); // Check first 20 lines
+    for (const line of contentLines) {
+      // Look for Laravel version information
+      const versionMatch = line.match(/Laravel\s+(\d+(\.\d+)?(\s+and\s+higher)?)/i);
+      if (versionMatch) {
+        subtitle = versionMatch[0].trim();
+        break;
+      }
+    }
+  }
+
+  return { title, subtitle };
 }
 
 // Parse markdown content to extract text
@@ -209,7 +240,7 @@ function parseMarkdownContent(content: string): string {
 async function processMarkdownFile(filePath: string, version: string, section: string, subsection?: string): Promise<DocPage | null> {
   try {
     const rawContent = await fetchGitHubContent(filePath);
-    const title = extractTitleFromMarkdown(rawContent);
+    const { title, subtitle } = extractTitleFromMarkdown(rawContent);
     const content = parseMarkdownContent(rawContent);
 
     if (!content || !title) {
@@ -220,6 +251,7 @@ async function processMarkdownFile(filePath: string, version: string, section: s
 
     return {
       title,
+      subtitle,
       url: githubUrl,
       content,
       rawContent,
@@ -324,7 +356,11 @@ function formatDocStructure(index: DocIndex): string {
 
     // List direct pages
     for (const page of section.pages) {
-      result += `- [${page.title}](${page.url})\n`;
+      result += `- [${page.title}](${page.url})`;
+      if (page.subtitle) {
+        result += ` - ${page.subtitle}`;
+      }
+      result += `\n`;
     }
 
     // List subsections
@@ -333,7 +369,11 @@ function formatDocStructure(index: DocIndex): string {
         result += `\n### ${subsectionKey}\n\n`;
 
         for (const page of section.subsections[subsectionKey]) {
-          result += `- [${page.title}](${page.url})\n`;
+          result += `- [${page.title}](${page.url})`;
+          if (page.subtitle) {
+            result += ` - ${page.subtitle}`;
+          }
+          result += `\n`;
         }
       }
     }
@@ -346,7 +386,7 @@ function formatDocStructure(index: DocIndex): string {
 
 // Search the documentation
 function searchInDocIndex(index: DocIndex, query: string): string {
-  const results: Array<{ title: string; url: string; snippet: string; score: number }> = [];
+  const results: Array<{ title: string; subtitle?: string; url: string; snippet: string; score: number }> = [];
   const queryTerms = query.toLowerCase().split(/\s+/);
 
   // Search in all pages
@@ -361,6 +401,7 @@ function searchInDocIndex(index: DocIndex, query: string): string {
         const snippet = getContentSnippet(page.content, queryTerms);
         results.push({
           title: page.title,
+          subtitle: page.subtitle,
           url: page.url,
           snippet,
           score
@@ -378,6 +419,7 @@ function searchInDocIndex(index: DocIndex, query: string): string {
             const snippet = getContentSnippet(page.content, queryTerms);
             results.push({
               title: page.title,
+              subtitle: page.subtitle,
               url: page.url,
               snippet,
               score
@@ -400,7 +442,11 @@ function searchInDocIndex(index: DocIndex, query: string): string {
   formattedResults += `Found ${results.length} result(s)\n\n`;
 
   for (const result of results) {
-    formattedResults += `## [${result.title}](${result.url})\n\n`;
+    formattedResults += `## [${result.title}](${result.url})`;
+    if (result.subtitle) {
+      formattedResults += ` - ${result.subtitle}`;
+    }
+    formattedResults += `\n\n`;
     formattedResults += `${result.snippet}\n\n`;
   }
 
@@ -412,11 +458,17 @@ function getSearchScore(page: DocPage, queryTerms: string[]): number {
   let score = 0;
   const content = page.content.toLowerCase();
   const title = page.title.toLowerCase();
+  const subtitle = page.subtitle?.toLowerCase() || '';
 
   for (const term of queryTerms) {
     // Title matches are weighted more heavily
     if (title.includes(term)) {
       score += 10;
+    }
+
+    // Subtitle matches are weighted more than content but less than title
+    if (subtitle && subtitle.includes(term)) {
+      score += 5;
     }
 
     // Content matches
