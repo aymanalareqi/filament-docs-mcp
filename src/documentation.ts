@@ -55,13 +55,6 @@ interface GitHubContent {
   encoding?: string;
 }
 
-interface GitHubDirectory {
-  [key: string]: {
-    files: GitHubContent[];
-    directories: string[];
-  }
-}
-
 // Initialize cache directory
 async function initCache() {
   try {
@@ -99,36 +92,88 @@ async function saveDocIndex(index: DocIndex) {
   await fs.writeFile(indexPath, JSON.stringify(index, null, 2));
 }
 
-// Fetch content from GitHub repository
-async function fetchGitHubContent(path: string, branch = DEFAULT_BRANCH): Promise<string> {
-  try {
-    const url = `${GITHUB_RAW_CONTENT_BASE}/${FILAMENT_REPO}/${branch}/${path}`;
-    const response = await axios.get(url);
-    return response.data;
-  } catch (error) {
-    console.error(`Error fetching GitHub content from ${path}:`, error);
-    throw error;
+// Fetch content from GitHub repository with retry mechanism
+async function fetchGitHubContent(path: string, branch = DEFAULT_BRANCH, retries = 3): Promise<string> {
+  let lastError;
+
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const url = `${GITHUB_RAW_CONTENT_BASE}/${FILAMENT_REPO}/${branch}/${path}`;
+      const response = await axios.get(url);
+      return response.data;
+    } catch (error: any) {
+      lastError = error;
+
+      // Check if we hit rate limit
+      if (error.response && error.response.status === 403 && error.response.headers['x-ratelimit-remaining'] === '0') {
+        const resetTime = parseInt(error.response.headers['x-ratelimit-reset']) * 1000;
+        const waitTime = Math.min(Math.max(resetTime - Date.now(), 0), 60000); // Wait at most 1 minute
+
+        console.error(`GitHub API rate limit exceeded. Waiting ${waitTime / 1000} seconds before retry...`);
+        await new Promise(resolve => setTimeout(resolve, waitTime));
+      } else if (attempt < retries) {
+        // Exponential backoff for other errors
+        const waitTime = Math.pow(2, attempt) * 1000;
+        console.error(`Error fetching GitHub content from ${path} (attempt ${attempt}/${retries}). Retrying in ${waitTime / 1000} seconds...`);
+        await new Promise(resolve => setTimeout(resolve, waitTime));
+      } else {
+        console.error(`Error fetching GitHub content from ${path} after ${retries} attempts:`, error);
+      }
+    }
   }
+
+  throw lastError || new Error(`Failed to fetch GitHub content from ${path} after ${retries} attempts`);
 }
 
-// List contents of a directory in the GitHub repository
-async function listGitHubDirectory(path: string, branch = DEFAULT_BRANCH): Promise<GitHubContent[]> {
-  try {
-    const url = `${GITHUB_API_BASE}/repos/${FILAMENT_REPO}/contents/${path}?ref=${branch}`;
-    const response = await axios.get(url, {
-      headers: {
-        'Accept': 'application/vnd.github.v3+json'
+// List contents of a directory in the GitHub repository with retry mechanism
+async function listGitHubDirectory(path: string, branch = DEFAULT_BRANCH, retries = 3): Promise<GitHubContent[]> {
+  let lastError;
+
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const url = `${GITHUB_API_BASE}/repos/${FILAMENT_REPO}/contents/${path}?ref=${branch}`;
+      const response = await axios.get(url, {
+        headers: {
+          'Accept': 'application/vnd.github.v3+json'
+        }
+      });
+      return response.data;
+    } catch (error: any) {
+      lastError = error;
+
+      // Check if we hit rate limit
+      if (error.response && error.response.status === 403 && error.response.headers['x-ratelimit-remaining'] === '0') {
+        const resetTime = parseInt(error.response.headers['x-ratelimit-reset']) * 1000;
+        const waitTime = Math.min(Math.max(resetTime - Date.now(), 0), 60000); // Wait at most 1 minute
+
+        console.error(`GitHub API rate limit exceeded. Waiting ${waitTime / 1000} seconds before retry...`);
+        await new Promise(resolve => setTimeout(resolve, waitTime));
+      } else if (attempt < retries) {
+        // Exponential backoff for other errors
+        const waitTime = Math.pow(2, attempt) * 1000;
+        console.error(`Error listing GitHub directory ${path} (attempt ${attempt}/${retries}). Retrying in ${waitTime / 1000} seconds...`);
+        await new Promise(resolve => setTimeout(resolve, waitTime));
+      } else {
+        console.error(`Error listing GitHub directory ${path} after ${retries} attempts:`, error);
       }
-    });
-    return response.data;
-  } catch (error) {
-    console.error(`Error listing GitHub directory ${path}:`, error);
-    return [];
+    }
   }
+
+  console.error(`Failed to list GitHub directory ${path} after ${retries} attempts:`, lastError);
+  return []; // Return empty array as fallback
 }
 
 // Extract title from markdown content
 function extractTitleFromMarkdown(content: string): string {
+  // Look for YAML frontmatter title
+  const frontmatterMatch = content.match(/^---\s+([\s\S]*?)---/);
+  if (frontmatterMatch && frontmatterMatch[1]) {
+    const titleMatch = frontmatterMatch[1].match(/title:\s*(.+)$/m);
+    if (titleMatch && titleMatch[1]) {
+      return titleMatch[1].trim();
+    }
+  }
+
   // Look for the first heading (# Title)
   const titleMatch = content.match(/^#\s+(.+)$/m);
   if (titleMatch && titleMatch[1]) {
@@ -469,13 +514,343 @@ export async function getDocumentationInfo(version = DEFAULT_VERSION): Promise<s
   return info;
 }
 
-export async function updateDocumentation(version?: string, force = false): Promise<string> {
-  const targetVersion = version || DEFAULT_VERSION;
+// Check available versions from GitHub
+async function checkAvailableVersions(): Promise<string[]> {
+  try {
+    const url = `${GITHUB_API_BASE}/repos/${FILAMENT_REPO}/branches`;
+    const response = await axios.get(url, {
+      headers: {
+        'Accept': 'application/vnd.github.v3+json'
+      }
+    });
 
+    // Filter branches that look like versions (e.g., 3.x, 2.x)
+    const versionBranches = response.data
+      .map((branch: any) => branch.name)
+      .filter((name: string) => /^\d+\.x$/.test(name));
+
+    return versionBranches;
+  } catch (error) {
+    console.error('Error checking available versions:', error);
+    return [DEFAULT_VERSION]; // Return default version if check fails
+  }
+}
+
+// Check for modified files since last update
+async function checkModifiedFiles(version = DEFAULT_VERSION, since: string): Promise<string[]> {
+  try {
+    // Convert the date to ISO format for the GitHub API
+    const sinceDate = new Date(since).toISOString();
+
+    // Get commits since the last update
+    const url = `${GITHUB_API_BASE}/repos/${FILAMENT_REPO}/commits?sha=${version}&since=${sinceDate}&path=packages`;
+    const response = await axios.get(url, {
+      headers: {
+        'Accept': 'application/vnd.github.v3+json'
+      }
+    });
+
+    // If no commits, no files were modified
+    if (!response.data || response.data.length === 0) {
+      return [];
+    }
+
+    // Get a list of all modified files from these commits
+    const modifiedFiles: Set<string> = new Set();
+
+    for (const commit of response.data) {
+      // Get the details of this commit to see which files were changed
+      const commitUrl = `${GITHUB_API_BASE}/repos/${FILAMENT_REPO}/commits/${commit.sha}`;
+      const commitResponse = await axios.get(commitUrl, {
+        headers: {
+          'Accept': 'application/vnd.github.v3+json'
+        }
+      });
+
+      // Add all modified markdown files in the docs directories
+      for (const file of commitResponse.data.files || []) {
+        if (file.filename.includes('/docs/') && file.filename.endsWith('.md')) {
+          modifiedFiles.add(file.filename);
+        }
+      }
+    }
+
+    return Array.from(modifiedFiles);
+  } catch (error) {
+    console.error('Error checking modified files:', error);
+    return []; // Return empty array if check fails
+  }
+}
+
+// Fetch documentation for a specific section
+async function fetchSectionDocStructure(version: string, sectionName: string): Promise<DocIndex> {
+  const index = await getDocIndex(version);
+
+  try {
+    // Map section name to package name
+    const packageSections: { [key: string]: string } = {
+      'Actions': 'actions',
+      'Forms': 'forms',
+      'Infolists': 'infolists',
+      'Notifications': 'notifications',
+      'Panels': 'panels',
+      'Support': 'support',
+      'Tables': 'tables',
+      'Widgets': 'widgets'
+    };
+
+    const packageName = packageSections[sectionName];
+    if (!packageName) {
+      throw new Error(`Unknown section: ${sectionName}`);
+    }
+
+    // Initialize section if it doesn't exist
+    if (!index.sections[sectionName]) {
+      index.sections[sectionName] = {
+        title: sectionName,
+        pages: [],
+        subsections: {}
+      };
+    } else {
+      // Clear existing pages and subsections
+      index.sections[sectionName].pages = [];
+      index.sections[sectionName].subsections = {};
+    }
+
+    // Get documentation files for this package
+    const docsPath = `packages/${packageName}/docs`;
+    const files = await listGitHubDirectory(docsPath, version);
+
+    // Sort files by name (which often includes numeric prefixes for order)
+    files.sort((a, b) => a.name.localeCompare(b.name));
+
+    for (const file of files) {
+      if (file.type === 'file' && file.name.endsWith('.md')) {
+        // Check if this is a subsection file (in a subdirectory)
+        const pathParts = file.path.split('/');
+        const isSubsection = pathParts.length > 4; // packages/name/docs/subdir/file.md
+
+        if (isSubsection) {
+          const subsectionName = pathParts[3]; // The subdirectory name
+          const formattedSubsectionName = subsectionName
+            .split('-')
+            .map(word => word.charAt(0).toUpperCase() + word.slice(1))
+            .join(' ');
+
+          // Initialize subsection if needed
+          if (!index.sections[sectionName].subsections![formattedSubsectionName]) {
+            index.sections[sectionName].subsections![formattedSubsectionName] = [];
+          }
+
+          // Process the markdown file
+          const page = await processMarkdownFile(file.path, version, sectionName, formattedSubsectionName);
+          if (page) {
+            index.sections[sectionName].subsections![formattedSubsectionName].push(page);
+          }
+        } else {
+          // This is a direct page in the section
+          const page = await processMarkdownFile(file.path, version, sectionName);
+          if (page) {
+            index.sections[sectionName].pages.push(page);
+          }
+        }
+      }
+    }
+
+    // Update the last updated timestamp
+    index.lastUpdated = new Date().toISOString();
+
+    // Save the updated index
+    await saveDocIndex(index);
+    return index;
+  } catch (error) {
+    console.error(`Error fetching section documentation for ${sectionName}:`, error);
+    return index;
+  }
+}
+
+// Process a single modified file
+async function processModifiedFile(filePath: string, version: string): Promise<boolean> {
+  try {
+    // Extract section from file path
+    // Example: packages/panels/docs/01-installation.md
+    const pathParts = filePath.split('/');
+    if (pathParts.length < 3) {
+      return false;
+    }
+
+    const packageName = pathParts[1];
+
+    // Map package name to section title
+    const packageSections: { [key: string]: string } = {
+      'actions': 'Actions',
+      'forms': 'Forms',
+      'infolists': 'Infolists',
+      'notifications': 'Notifications',
+      'panels': 'Panels',
+      'support': 'Support',
+      'tables': 'Tables',
+      'widgets': 'Widgets'
+    };
+
+    const sectionName = packageSections[packageName];
+    if (!sectionName) {
+      return false;
+    }
+
+    // Get the current index
+    const index = await getDocIndex(version);
+
+    // Check if this is a subsection file
+    const isSubsection = pathParts.length > 4; // packages/name/docs/subdir/file.md
+
+    if (isSubsection) {
+      const subsectionName = pathParts[3]; // The subdirectory name
+      const formattedSubsectionName = subsectionName
+        .split('-')
+        .map(word => word.charAt(0).toUpperCase() + word.slice(1))
+        .join(' ');
+
+      // Initialize section and subsection if needed
+      if (!index.sections[sectionName]) {
+        index.sections[sectionName] = {
+          title: sectionName,
+          pages: [],
+          subsections: {}
+        };
+      }
+
+      if (!index.sections[sectionName].subsections![formattedSubsectionName]) {
+        index.sections[sectionName].subsections![formattedSubsectionName] = [];
+      }
+
+      // Process the markdown file
+      const page = await processMarkdownFile(filePath, version, sectionName, formattedSubsectionName);
+      if (page) {
+        // Remove any existing version of this file
+        index.sections[sectionName].subsections![formattedSubsectionName] =
+          index.sections[sectionName].subsections![formattedSubsectionName].filter(p => p.path !== filePath);
+
+        // Add the updated file
+        index.sections[sectionName].subsections![formattedSubsectionName].push(page);
+      }
+    } else {
+      // This is a direct page in the section
+      if (!index.sections[sectionName]) {
+        index.sections[sectionName] = {
+          title: sectionName,
+          pages: [],
+          subsections: {}
+        };
+      }
+
+      const page = await processMarkdownFile(filePath, version, sectionName);
+      if (page) {
+        // Remove any existing version of this file
+        index.sections[sectionName].pages = index.sections[sectionName].pages.filter(p => p.path !== filePath);
+
+        // Add the updated file
+        index.sections[sectionName].pages.push(page);
+      }
+    }
+
+    // Save the updated index
+    await saveDocIndex(index);
+    return true;
+  } catch (error) {
+    console.error(`Error processing modified file ${filePath}:`, error);
+    return false;
+  }
+}
+
+export async function updateDocumentation(
+  version?: string,
+  force = false,
+  section?: string,
+  checkVersions = false
+): Promise<string> {
+  let targetVersion = version || DEFAULT_VERSION;
+  let result = '';
+
+  // Check available versions if requested
+  if (checkVersions) {
+    const availableVersions = await checkAvailableVersions();
+    result += `Available versions: ${availableVersions.join(', ')}\n\n`;
+
+    // Validate the requested version
+    if (version && !availableVersions.includes(version)) {
+      result += `Warning: Requested version '${version}' not found. Using default version '${DEFAULT_VERSION}' instead.\n\n`;
+      targetVersion = DEFAULT_VERSION;
+    }
+  }
+
+  // If a specific section is requested
+  if (section) {
+    const index = await getDocIndex(targetVersion);
+    const lastUpdated = new Date(index.lastUpdated);
+    const now = new Date();
+    const daysSinceUpdate = (now.getTime() - lastUpdated.getTime()) / (1000 * 60 * 60 * 24);
+
+    if (force || daysSinceUpdate > 7 || !index.sections[section]) {
+      result += `Updating documentation for section '${section}' (version ${targetVersion})...\n`;
+      await fetchSectionDocStructure(targetVersion, section);
+      result += `Documentation for section '${section}' (version ${targetVersion}) has been updated from GitHub.`;
+      return result;
+    } else {
+      // Check for modified files in this section
+      const modifiedFiles = await checkModifiedFiles(targetVersion, lastUpdated.toISOString());
+
+      // Filter files for this section
+      const sectionFiles = modifiedFiles.filter(file => {
+        const pathParts = file.split('/');
+        if (pathParts.length < 3) return false;
+
+        const packageName = pathParts[1];
+        const packageSections: { [key: string]: string } = {
+          'actions': 'Actions',
+          'forms': 'Forms',
+          'infolists': 'Infolists',
+          'notifications': 'Notifications',
+          'panels': 'Panels',
+          'support': 'Support',
+          'tables': 'Tables',
+          'widgets': 'Widgets'
+        };
+
+        return packageSections[packageName] === section;
+      });
+
+      if (sectionFiles.length > 0) {
+        result += `Found ${sectionFiles.length} modified files for section '${section}' since last update.\n`;
+
+        // Process each modified file
+        let updatedCount = 0;
+        for (const file of sectionFiles) {
+          result += `Updating file: ${file}\n`;
+          const success = await processModifiedFile(file, targetVersion);
+          if (success) updatedCount++;
+        }
+
+        // Update the last updated timestamp
+        const index = await getDocIndex(targetVersion);
+        index.lastUpdated = new Date().toISOString();
+        await saveDocIndex(index);
+
+        result += `Updated ${updatedCount} files for section '${section}' (version ${targetVersion}).`;
+        return result;
+      }
+
+      return `${result}Documentation for section '${section}' (version ${targetVersion}) is already up to date (last updated ${lastUpdated.toLocaleString()}).`;
+    }
+  }
+
+  // For full documentation update
   if (force) {
     // Force update by fetching the documentation from GitHub
+    result += `Forcefully updating all documentation for version ${targetVersion}...\n`;
     await fetchDocStructure(targetVersion);
-    return `Documentation for version ${targetVersion} has been forcefully updated from GitHub.`;
+    result += `Documentation for version ${targetVersion} has been forcefully updated from GitHub.`;
+    return result;
   }
 
   // Check if we need to update
@@ -486,9 +861,32 @@ export async function updateDocumentation(version?: string, force = false): Prom
 
   if (daysSinceUpdate > 7 || Object.keys(index.sections).length === 0) {
     // Update if it's been more than a week or if the index is empty
+    result += `Updating all documentation for version ${targetVersion}...\n`;
     await fetchDocStructure(targetVersion);
-    return `Documentation for version ${targetVersion} has been updated from GitHub.`;
+    result += `Documentation for version ${targetVersion} has been updated from GitHub.`;
+    return result;
   }
 
-  return `Documentation for version ${targetVersion} is already up to date (last updated ${lastUpdated.toLocaleString()}).`;
+  // Check for modified files since last update
+  const modifiedFiles = await checkModifiedFiles(targetVersion, lastUpdated.toISOString());
+  if (modifiedFiles.length > 0) {
+    result += `Found ${modifiedFiles.length} modified files since last update.\n`;
+
+    // Process each modified file
+    let updatedCount = 0;
+    for (const file of modifiedFiles) {
+      result += `Updating file: ${file}\n`;
+      const success = await processModifiedFile(file, targetVersion);
+      if (success) updatedCount++;
+    }
+
+    // Update the last updated timestamp
+    index.lastUpdated = new Date().toISOString();
+    await saveDocIndex(index);
+
+    result += `Updated ${updatedCount} files for version ${targetVersion}.`;
+    return result;
+  }
+
+  return `${result}Documentation for version ${targetVersion} is already up to date (last updated ${lastUpdated.toLocaleString()}).`;
 }

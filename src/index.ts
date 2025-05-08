@@ -57,7 +57,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "update_docs",
-        description: "A documentation synchronization tool that ensures you have access to the latest Filament documentation. This tool can target specific versions and force updates when necessary.",
+        description: "A documentation synchronization tool that ensures you have access to the latest Filament documentation. This tool can target specific versions, sections, and control update behavior.",
         inputSchema: {
           type: "object",
           properties: {
@@ -68,6 +68,14 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             force: {
               type: "boolean",
               description: "Whether to force an update even if the documentation is already up to date"
+            },
+            section: {
+              type: "string",
+              description: "Specific section to update (e.g., 'Panels', 'Forms'). If not provided, all sections will be updated."
+            },
+            check_versions: {
+              type: "boolean",
+              description: "Whether to check available versions from GitHub before updating"
             }
           },
           required: []
@@ -84,7 +92,9 @@ const searchDocsSchema = z.object({
 
 const updateDocsSchema = z.object({
   version: z.string().optional().describe("The version of documentation to update to (e.g., '3.x')"),
-  force: z.boolean().optional().describe("Whether to force an update even if the documentation is already up to date")
+  force: z.boolean().optional().describe("Whether to force an update even if the documentation is already up to date"),
+  section: z.string().optional().describe("Specific section to update (e.g., 'Panels', 'Forms'). If not provided, all sections will be updated."),
+  check_versions: z.boolean().optional().describe("Whether to check available versions from GitHub before updating")
 });
 
 // Implement the tool handler
@@ -102,7 +112,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           ]
         };
       }
-      
+
       case "search_docs": {
         const args = searchDocsSchema.parse(request.params.arguments);
         const results = await searchDocumentation(args.query);
@@ -115,7 +125,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           ]
         };
       }
-      
+
       case "docs_info": {
         const info = await getDocumentationInfo();
         return {
@@ -127,10 +137,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           ]
         };
       }
-      
+
       case "update_docs": {
         const args = updateDocsSchema.parse(request.params.arguments);
-        const result = await updateDocumentation(args.version, args.force);
+        const result = await updateDocumentation(args.version, args.force, args.section, args.check_versions);
         return {
           content: [
             {
@@ -140,7 +150,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           ]
         };
       }
-      
+
       default:
         return {
           isError: true,
